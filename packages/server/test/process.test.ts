@@ -238,6 +238,7 @@ it.live("web plugin imports consume one ticket for one revision, issued after pa
     const code = "module.exports = { setup() {} }"
     yield* Effect.promise(() => Bun.write(path.join(plugin, "gui-experimental.cjs"), code))
     const server = yield* ServerProcess.start<never, never>({
+      app: { channel: "latest" },
       hostname: "127.0.0.1",
       port: 0,
       password: "secret",
@@ -245,7 +246,7 @@ it.live("web plugin imports consume one ticket for one revision, issued after pa
       config: {
         directory: dir,
         project: false,
-        content: JSON.stringify({ plugins: [plugin], experimental: { web_plugin_gui: true } }),
+        content: JSON.stringify({ plugins: [plugin] }),
       },
       models: { fetch: false },
     })

@@ -9,7 +9,6 @@ export const wildcard = "all"
  * `experimental.all_flags: true` turn every flag on. Read one with Core's `Flag.enabled("<key>")`.
  */
 export const registry = {
-  web_plugin_gui: "Load configured GUI plugins from the server that serves the web app.",
   todo: "Enable the experimental todowrite tool.",
   background_compaction:
     "Enable experimental background compaction: summarize the conversation in the background as it nears the compaction threshold, so automatic compaction does not wait for the summary. Background summaries that are never used still cost tokens.",

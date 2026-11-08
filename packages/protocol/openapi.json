@@ -13580,7 +13580,7 @@
             }
           }
         },
-        "description": "List active GUIs in the server's startup directory with a short-lived, single-use module ticket. Experimental: may change without compatibility guarantees. Requires experimental.web_plugin_gui.",
+        "description": "List active GUIs in the server's startup directory with a short-lived, single-use module ticket. Experimental: may change without compatibility guarantees.",
         "summary": "List web plugin modules"
       }
     },
@@ -13675,7 +13675,7 @@
             }
           }
         },
-        "description": "Consume a ticket for the exact plugin and revision and return its CommonJS factory as JavaScript. Experimental: may change without compatibility guarantees. Requires experimental.web_plugin_gui.",
+        "description": "Consume a ticket for the exact plugin and revision and return its CommonJS factory as JavaScript. Experimental: may change without compatibility guarantees.",
         "summary": "Load a web plugin module"
       }
     },
@@ -16852,9 +16852,6 @@
                 "type": "boolean"
               },
               "all_flags": {
-                "type": "boolean"
-              },
-              "web_plugin_gui": {
                 "type": "boolean"
               },
               "todo": {

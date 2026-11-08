@@ -5,7 +5,7 @@ import { ForbiddenError, LocationNotFoundError, PluginNotFoundError, ServiceUnav
 
 export const WEB_PLUGIN_MODULE_PATH = "/api/experimental/plugin/web-module"
 
-const description = "Experimental: may change without compatibility guarantees. Requires experimental.web_plugin_gui."
+const description = "Experimental: may change without compatibility guarantees."
 
 export const WebPluginEndpoints = [
   HttpApiEndpoint.post("plugin.webList", "/api/experimental/plugin/web-list", {

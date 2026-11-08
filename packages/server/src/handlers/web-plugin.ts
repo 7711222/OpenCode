@@ -1,4 +1,3 @@
-import { Flag } from "@opencode/core/flag"
 import { Location } from "@opencode/core/location"
 import { LocationServiceMap } from "@opencode/core/location-service-map"
 import { Plugin } from "@opencode/core/plugin"
@@ -22,7 +21,6 @@ export const makeWebPlugin = Effect.gen(function* () {
     list: (request: HttpServerRequest.HttpServerRequest) =>
       Effect.gen(function* () {
         if (!own(request)) return yield* new ForbiddenError({ message: "Web plugin modules are same-origin only" })
-        if (!(yield* Flag.enabled("web_plugin_gui"))) return []
         yield* awaitPlugins
         const plugins = yield* Plugin.Service
         return yield* Effect.forEach(yield* plugins.guis(), (gui) =>
@@ -38,8 +36,6 @@ export const makeWebPlugin = Effect.gen(function* () {
         if (!own(request) || !(yield* tickets.consume({ pluginGui: query, ticket: query.ticket })))
           return yield* new ForbiddenError({ message: "Invalid web plugin module ticket" })
         return yield* Effect.gen(function* () {
-          if (!(yield* Flag.enabled("web_plugin_gui")))
-            return yield* new ForbiddenError({ message: "Web plugin GUIs are disabled" })
           const plugins = yield* Plugin.Service
           const bundle = yield* plugins.gui(query.id)
           if (!bundle || bundle.revision !== query.revision)
