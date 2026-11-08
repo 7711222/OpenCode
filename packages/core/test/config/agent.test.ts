@@ -452,6 +452,7 @@ permissions:
               `---
 model: openrouter/openai/gpt-5
 description: Markdown description
+color: accent
 temperature: 0.5
 tools:
   write: false
@@ -500,6 +501,7 @@ Use native v2 fields.`,
             model: { providerID: "openrouter", id: "openai/gpt-5" },
             system: "Review carefully.",
             description: "Markdown description",
+            color: "#9d7cd8",
             request: { body: { temperature: 0.5 } },
             permissions: [...defaultPermissions, { action: "edit", resource: "*", effect: "deny" }],
           })
