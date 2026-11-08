@@ -2,9 +2,7 @@ export * as SessionSearchMaintenance from "./search-maintenance.js"
 
 import { Cause, Clock, Context, Effect, Latch, Layer, Option, RcMap, Schema, Stream } from "effect"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
-import { App } from "../app.js"
 import { Bus } from "../bus.js"
-import { Config } from "../config.js"
 import { Database } from "../database/database.js"
 import { Flag } from "../flag.js"
 import { LocationServiceMap } from "../location-service-map.js"
@@ -47,7 +45,6 @@ export const layer = Layer.effect(
     const bus = yield* Bus.Service
     const locations = yield* LocationServiceMap.Service
     const doorbell = yield* Latch.make()
-    const resolve = yield* Flag.resolver
     const state = {
       active: false,
       unsupported: false,
@@ -76,8 +73,7 @@ export const layer = Layer.effect(
         Effect.gen(function* () {
           const context = yield* locations.contextEffectOption(ref)
           if (Option.isNone(context)) return undefined
-          const entries = yield* Context.get(context.value, Config.Service).entries()
-          return resolve(entries).sqlite_fts.enabled
+          return yield* Context.get(context.value, Flag.Service).enabled("sqlite_fts")
         }).pipe(
           Effect.scoped,
           Effect.orElseSucceed(() => undefined),
@@ -173,5 +169,5 @@ export const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: Service,
   layer,
-  deps: [App.node, Bus.node, Database.node, LocationServiceMap.node],
+  deps: [Bus.node, Database.node, LocationServiceMap.node],
 })

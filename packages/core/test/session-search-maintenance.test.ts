@@ -7,7 +7,7 @@ import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import { Bus } from "@opencode/core/bus"
-import { Config } from "@opencode/core/config"
+import { Flag } from "@opencode/core/flag"
 import { Database } from "@opencode/core/database/database"
 import { Location } from "@opencode/core/location"
 import { LocationServiceMap, type LocationServices } from "@opencode/core/location-services"
@@ -32,10 +32,10 @@ const locations = Layer.effect(
   Effect.gen(function* () {
     const map = yield* LayerMap.make(
       (ref: Location.Ref) =>
-        // The maintenance loop only reads Config from a location.
+        // The maintenance loop only reads flags from a location.
         // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
         Layer.mergeAll(
-          Config.testLayer([
+          Flag.testLayer([
             new Document({
               type: "document",
               info: new Info({
