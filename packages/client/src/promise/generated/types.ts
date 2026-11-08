@@ -2546,11 +2546,13 @@ export type ConfigEntry =
         experimental?: {
           portable_shell_scanner?: boolean
           all_flags?: boolean
+          web_plugin_gui?: boolean
           todo?: boolean
           background_compaction?: boolean
           media_blob?: boolean
           schedules?: boolean
           artifacts?: boolean
+          codemode_vm?: boolean
           part_rows?: boolean
           image_generate?: boolean | { model?: string | { providerID: string; model: string; variant?: string } }
           subagent_depth?: number
@@ -4702,6 +4704,21 @@ export type ExperimentalJobListInput = {
 }
 
 export type ExperimentalJobListOutput = { data: Array<JobInfo> }["data"]
+
+export type ExperimentalPluginWebListOutput = Array<{
+  id: PluginID
+  revision: string
+  options: { [x: string]: JsonValue }
+  ticket: string
+}>
+
+export type ExperimentalPluginWebModuleInput = {
+  readonly id: string
+  readonly revision: string
+  readonly ticket: string
+}
+
+export type ExperimentalPluginWebModuleOutput = globalThis.Uint8Array
 
 export type ShellListInput = { readonly location?: { readonly directory?: string | undefined } | undefined }
 

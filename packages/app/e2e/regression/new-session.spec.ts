@@ -92,6 +92,35 @@ test("the location shortcuts choose worktrees from every state and keep cycling"
   await expect(view.editor).toBeFocused()
 })
 
+test("Local shows and targets the main checkout when the draft opened in a worktree", async ({ page }) => {
+  const root = "C:/OpenCode/LocalFromWorktree"
+
+  const worktree = `${root}/.worktrees/quiet-river`
+
+  const created: unknown[] = []
+
+  const view = await openDraft(page, {
+    name: "LocalFromWorktree",
+    project: { sandboxes: [worktree] },
+    worktrees: () => [{ directory: root }, { directory: worktree, strategy: "git" }],
+    vcs: (directory) =>
+      directory === worktree
+        ? { current: "worktree-branch", default: "dev" }
+        : { current: "checkout-branch", default: "dev" },
+    onSessionCreate: (body) => void created.push(body.location),
+    seed: { tabs: [{ draft: "draft_localfromworktree", directory: worktree }] },
+  })
+
+  const screen = page.locator('[data-component="new-session"]')
+
+  await expect(newSessionWorktree(page)).toHaveText("Local")
+  await expect(screen.getByText("checkout-branch", { exact: true })).toBeVisible()
+  await expect(screen.getByText("worktree-branch", { exact: true })).toHaveCount(0)
+  await view.editor.fill("Run in the main checkout")
+  await submit(page).click()
+  await expect.poll(() => created).toEqual([{ directory: root }])
+})
+
 for (const binding of ["custom", "none"]) {
   test(`the picker tooltips reflect ${binding} shortcuts`, async ({ page }) => {
     const view = await openDraft(page, {
@@ -971,6 +1000,61 @@ test("keeps the draft on the main checkout when session creation fails, then ret
   await expect(page.locator('[data-component="user-message"] [data-slot="user-message-text"]')).toHaveText(text)
 })
 
+// Before, a create whose response stalled left the pending tab on "Starting session" with the prompt locked.
+test("a stalled session create returns to the draft, and the Session it creates later is deleted unused", async ({
+  page,
+}) => {
+  const held = Promise.withResolvers<void>()
+  const creates: string[] = []
+  const prompts: string[] = []
+  await page.clock.install()
+
+  const view = await openDraft(page, {
+    ...pendingDraft,
+    onPrompt: (prompt) => void prompts.push(prompt.sessionID),
+    onSessionCreate: async (body, attempt) => {
+      creates.push(String(body.id))
+
+      if (attempt === 1) await held.promise
+    },
+  })
+
+  await view.editor.fill(text)
+  await submit(page).click()
+  await expect.poll(() => creates.length).toBe(1)
+  const stalled = creates[0]!
+  await expectPath(page, sessionHref(stalled))
+  await expect(page.locator('[data-component="session-preparing"]').getByRole("status")).toContainText(
+    "Starting session",
+  )
+
+  // The create phase's time limit, below the request queue's 60 s wait for response headers.
+  await page.clock.fastForward(30_000)
+
+  await expectPath(page, draftHref(draftID))
+  await expect(page.getByText("Failed to create session", { exact: true })).toBeVisible()
+  await expect(
+    page.getByText("The server took too long to respond. Send again to retry.", { exact: true }),
+  ).toBeVisible()
+  await expect(view.editor).toHaveText(text)
+  await expect(submit(page)).toBeEnabled()
+  await expect(tabLink(page, stalled)).toHaveCount(0)
+
+  const removed = page.waitForRequest(
+    (request) => request.method() === "DELETE" && new URL(request.url()).pathname === `/api/session/${stalled}`,
+  )
+
+  held.resolve()
+  await removed
+
+  await submit(page).click()
+
+  await expect.poll(() => creates.length).toBe(2)
+  await expect.poll(() => prompts).toEqual([creates[1]])
+  await expectPath(page, sessionHref(creates[1]!))
+  await expect(page.locator('[data-component="user-message"] [data-slot="user-message-text"]')).toHaveText(text)
+})
+
 test("a new session's first prompt stays once its missed admission echo resyncs the session", async ({ page }) => {
   const messages: SessionMessageInfo[] = []
   const created: string[] = []
@@ -1237,6 +1321,17 @@ test("the location dialog separates added projects from server projects and tags
   await search.fill("no-worktree-matches")
   await expect(options).toHaveCount(0)
   await expect(dialog.getByRole("separator")).toHaveCount(0)
+  // Open project from the worktree step returns to that step with its search, not to the projects.
+  const open = (await page.evaluate(() => navigator.platform.includes("Mac"))) ? "Meta+o" : "Control+o"
+  await search.fill("open")
+  await page.keyboard.press(open)
+  await expect(back).toHaveText("Servers")
+  await expect(search).toHaveValue("")
+  await page.keyboard.press("Escape")
+  await expect(back).toHaveText("Run session in")
+  await expect(search).toHaveValue("open")
+  await expect(options.locator(".command-palette-title")).toHaveText(["opencode", "New worktree", "opencode-beta"])
+  await expect(options.nth(0)).toHaveAttribute("aria-selected", "true")
   await search.fill("")
   await expect(options.nth(0)).toHaveAttribute("aria-selected", "true")
   await page.keyboard.press("Backspace")
@@ -1248,7 +1343,7 @@ test("the location dialog separates added projects from server projects and tags
   await expect(rows.nth(0)).toHaveAttribute("aria-selected", "true")
   await page.keyboard.press("ArrowUp")
   await expect(options.nth(3)).toHaveAttribute("aria-selected", "true")
-  await page.keyboard.press((await page.evaluate(() => navigator.platform.includes("Mac"))) ? "Meta+o" : "Control+o")
+  await page.keyboard.press(open)
   await expect(back).toHaveText("Servers")
   // The server the app runs beside shows its hostname and "This computer" instead of its address.
   await expect(options).toHaveText(["hailmaryThis computer", "apollo"])

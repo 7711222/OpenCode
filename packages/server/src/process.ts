@@ -9,6 +9,7 @@ import { hasPtyConnectTicketURL } from "@opencode/protocol/groups/pty"
 import { hasPersistentPtyConnectTicketURL } from "@opencode/protocol/groups/persistent-pty"
 import { hasMcpClientTicketURL } from "@opencode/protocol/groups/mcp"
 import { isPairingConnectURL } from "@opencode/protocol/groups/server"
+import { WEB_PLUGIN_MODULE_PATH } from "@opencode/protocol/groups/web-plugin"
 import { Global } from "@opencode/util/global"
 import { Cause, Context, Effect, Exit, Latch, Layer, Option, Ref, Scope } from "effect"
 import { HttpMiddleware, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
@@ -18,6 +19,7 @@ import { ServerAuth } from "./auth"
 import { isAllowedCorsOrigin } from "./cors"
 import { authorizedRequest, unauthorizedResponse } from "./middleware/authorization"
 import { withoutParentSpan } from "./request-tracing"
+import { RequestSite } from "./request-site"
 import { createRoutes } from "./routes"
 import { ServerInfo } from "./server-info"
 import { Status } from "./service-status"
@@ -72,6 +74,7 @@ export const start = Effect.fn("ServerProcess.start")(function* <E, R>(
   yield* bound.http
     .serve(
       (transform ? transform(app) : app).pipe(
+        RequestSite.middleware(options),
         HttpMiddleware.compression(),
         HttpMiddleware.cors({ allowedOrigins: (origin) => isAllowedCorsOrigin(origin, options), maxAge: 86_400 }),
       ),
@@ -199,7 +202,10 @@ function dispatch(
     if (
       !isPairingConnectURL(url) &&
       (!ready ||
-        (!hasPtyConnectTicketURL(url) && !hasPersistentPtyConnectTicketURL(url) && !hasMcpClientTicketURL(url))) &&
+        (!hasPtyConnectTicketURL(url) &&
+          !hasPersistentPtyConnectTicketURL(url) &&
+          !hasMcpClientTicketURL(url) &&
+          !(url.pathname === WEB_PLUGIN_MODULE_PATH && url.searchParams.get("ticket")))) &&
       !(yield* authorizedRequest(request, auth))
     )
       return unauthorizedResponse(request)

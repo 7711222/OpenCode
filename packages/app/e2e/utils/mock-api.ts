@@ -39,6 +39,7 @@ const Query = Schema.Struct({
   query: Schema.optional(Schema.String),
   type: Schema.optional(Schema.String),
   mode: Schema.optional(Schema.String),
+  context: Schema.optional(Schema.String),
 })
 
 const SessionParams = { sessionID: Schema.String }
@@ -150,6 +151,18 @@ const Group = HttpApiGroup.make("mock")
     }),
   )
   .add(
+    HttpApiEndpoint.post(
+      "integrationOAuthComplete",
+      "/api/integration/:integrationID/connect/oauth/:attemptID/complete",
+      {
+        params: { integrationID: Schema.String, attemptID: Schema.String },
+        payload: JsonPayload,
+        success: NoContent,
+        error: Unsupported,
+      },
+    ),
+  )
+  .add(
     HttpApiEndpoint.delete("integrationOAuthCancel", "/api/integration/:integrationID/connect/oauth/:attemptID", {
       params: { integrationID: Schema.String, attemptID: Schema.String },
       success: NoContent,
@@ -184,6 +197,7 @@ const Group = HttpApiGroup.make("mock")
   .add(HttpApiEndpoint.get("command", "/api/command", { success: Json }))
   .add(HttpApiEndpoint.get("skill", "/api/skill", { success: Json }))
   .add(HttpApiEndpoint.get("plugin", "/api/plugin", { success: Json }))
+  .add(HttpApiEndpoint.post("webPluginList", "/api/experimental/plugin/web-list", { success: Json }))
   .add(HttpApiEndpoint.get("mcp", "/api/mcp", { success: Json }))
   .add(
     HttpApiEndpoint.post("mcpConnect", "/api/experimental/mcp/:server/connect", {
@@ -199,7 +213,12 @@ const Group = HttpApiGroup.make("mock")
       error: MockNotFound.pipe(HttpApiSchema.status(404)),
     }),
   )
-  .add(HttpApiEndpoint.get("mcpResource", "/api/mcp/resource", { success: Json }))
+  .add(
+    HttpApiEndpoint.get("mcpResource", "/api/mcp/resource", {
+      success: Json,
+      error: MockInternal.pipe(HttpApiSchema.status(500)),
+    }),
+  )
   .add(HttpApiEndpoint.get("projectList", "/api/project", { success: Json }))
   .add(
     HttpApiEndpoint.patch("projectUpdate", "/api/project/:projectID", {

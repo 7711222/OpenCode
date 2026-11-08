@@ -1,27 +1,20 @@
-import { createEffect, createMemo, createResource, createSignal, onCleanup } from "solid-js"
+import { createEffect, createMemo, onCleanup, untrack } from "solid-js"
 import type { PluginOptions } from "@opencode/plugin/gui"
-import {
-  pluginIdAvailable,
-  runsOn,
-  shipsPluginGui,
-  type Bridge,
-  type BridgePluginGui,
-  type BridgePluginGuis,
-  type Entry,
-} from "@opencode/plugin/gui/host"
+import { pluginIdAvailable, runsOn, type Bridge, type Entry, type PluginFactory } from "@opencode/plugin/gui/host"
 import type { OpenCodeClient } from "@opencode/client/promise"
 import { useGlobal } from "@/runtime/server/runtime"
 import { ServerConnection, useServers } from "@/runtime/server/registry"
 import { builtins } from "./builtins"
 import { pluginDefinition } from "./module"
-
-/** A plugin's `./gui-experimental` bundle as this window evaluated it, at one revision. */
-type Loaded = {
-  readonly id: string
-  readonly revision: string
-  readonly definition: Entry
-  readonly options: PluginOptions
-}
+import {
+  createPluginGuiState,
+  PLUGIN_GUI_INITIAL_TIMEOUT_MS,
+  transitionPluginGui,
+  type LoadedPluginGui,
+  type GuiSource,
+  type PluginGuiEffect,
+  type PluginGuiEvent,
+} from "./plugin-gui-machine"
 
 /** A plugin's GUI as the plugin host runs it: its definition, options, and the client of the server that runs it. */
 export type PluginGui = {
@@ -33,8 +26,7 @@ export type PluginGui = {
 /**
  * Loads the plugin GUIs that run in this window. On the desktop, main alone lists the plugins on the app's own
  * server and reads their `./gui-experimental` bundles; this window evaluates what main sends, so every window and
- * main run the same set. That server already runs the plugins' server entries, so their bundles add no new source
- * of code; other servers' plugins load no GUI.
+ * main run the same set. Other servers' plugins load no GUI.
  *
  * On the web there is no main process: the window itself lists the plugins on the server that served it, reads
  * their bundles there, and follows that server's `plugin.updated` event, the rules main applies for its own server.
@@ -59,124 +51,149 @@ export function PluginGuiLoader(props: {
     return conn ? global.serverCtx(ServerConnection.key(conn)) : undefined
   })
 
-  // One evaluation per plugin revision, so an unchanged plugin keeps its definition and the host does not reload it.
-  const cache = new Map<string, Loaded>()
-  const [guis, setGuis] = createSignal<BridgePluginGuis>()
+  // The server that runs the plugin, read each time: it is a new client after that server restarts.
+  const client = () => controller()?.sdk.api
+  const initial = createPluginGuiState()
+  const machine = { state: initial.state }
+  // Events an effect raises synchronously wait behind that effect.
+  const queue: PluginGuiEvent[] = []
+  let timer: ReturnType<typeof setTimeout> | undefined
+
+  const dispatch = (event: PluginGuiEvent) => {
+    queue.push(event)
+
+    if (queue.length === 1) untrack(drain)
+  }
+
+  const drain = () => {
+    const event = queue[0]
+
+    if (!event) return
+
+    try {
+      const next = transitionPluginGui(machine.state, event)
+
+      machine.state = next.state
+      next.effects.forEach((effect) =>
+        Promise.try(() => run(effect)).catch((cause: unknown) =>
+          console.error("[plugin] plugin GUI effect failed", cause),
+        ),
+      )
+    } finally {
+      queue.shift()
+    }
+
+    drain()
+  }
+
+  const run = (effect: PluginGuiEffect) => {
+    if (effect.type === "fetch.initial") {
+      const bridge = props.bridge
+
+      if (!bridge) return
+
+      return void Promise.try(() => bridge.pluginGuis()).then(
+        (guis) => dispatch({ type: "initial.resolved", attempt: effect.attempt, guis }),
+        (cause: unknown) => dispatch({ type: "initial.failed", attempt: effect.attempt, cause }),
+      )
+    }
+
+    if (effect.type === "timer.start") {
+      clearTimeout(timer)
+      timer = setTimeout(() => dispatch({ type: "timeout", attempt: effect.attempt }), PLUGIN_GUI_INITIAL_TIMEOUT_MS)
+
+      return
+    }
+
+    if (effect.type === "timer.stop") {
+      clearTimeout(timer)
+      timer = undefined
+
+      return
+    }
+
+    if (effect.type === "evaluate")
+      return void Promise.all(effect.plugins.map(evaluate)).then(
+        (loaded) =>
+          dispatch({ type: "evaluated", attempt: effect.attempt, loaded: loaded.filter((item) => item !== undefined) }),
+        (cause: unknown) => dispatch({ type: "evaluate.failed", attempt: effect.attempt, cause }),
+      )
+
+    if (effect.type === "publish")
+      return props.onChange(
+        effect.plugins
+          .filter((plugin) => props.bridge || runsOn(plugin.definition, undefined))
+          .map((plugin) => ({ definition: plugin.definition, options: plugin.options, client })),
+        effect.reserved,
+      )
+
+    console.error("[plugin] failed to load plugin GUIs", effect.cause)
+  }
+
+  onCleanup(() => dispatch({ type: "disposed" }))
 
   if (props.bridge) {
     onCleanup(
       props.bridge.on((message) => {
-        if (message.type === "pluginGuis") setGuis({ plugins: message.plugins, reserved: message.reserved })
+        if (message.type === "pluginGuis") dispatch({ type: "pushed", guis: message })
       }),
     )
-    // A change main pushed while this request was in flight is newer than its reply.
-    void props.bridge.pluginGuis().then(
-      (initial) => setGuis((current) => current ?? initial),
-      () => undefined,
-    )
-  } else {
-    // A web window lists its own server's plugins itself: only plugins that ship a bundle, only ids no built-in of
-    // this window claims, and a bundle that cannot be read is left out until the next change.
-    let listing = 0
+    initial.effects.forEach(run)
 
-    const listPlugins = async () => {
-      const api = controller()?.sdk.api
-
-      if (!api) return
-
-      const seq = ++listing
-
-      const listed = await api.plugin.list().then(
-        (result) => result.data,
-        () => undefined,
-      )
-
-      if (!listed || seq !== listing) return
-
-      const shipped = listed.filter(shipsPluginGui)
-      const reserved = shipped.flatMap((plugin) => (pluginIdAvailable(plugin.id, builtins) ? [] : [plugin.id]))
-      const loadable = shipped.filter((plugin) => !reserved.includes(plugin.id))
-
-      const read = await Promise.all(
-        loadable.map((plugin) =>
-          api.plugin.gui({ id: plugin.id }).then(
-            (result) => result.data,
-            () => undefined,
-          ),
-        ),
-      )
-
-      // A newer listing that began while this one read its bundles decides.
-      if (seq !== listing) return
-
-      setGuis({
-        plugins: loadable.flatMap((plugin, index) => {
-          const bundle = read[index]
-
-          return bundle
-            ? [{ id: plugin.id, revision: bundle.revision, code: bundle.code, options: bundle.options }]
-            : []
-        }),
-        reserved,
-      })
-    }
-
-    // Lists once the server connects and again whenever its plugins change, the events main follows for its own.
-    createEffect(() => {
-      const ctx = controller()
-
-      if (!ctx) return
-
-      if (ctx.sdk.connection.status() === "connected") void listPlugins()
-
-      onCleanup(ctx.sdk.event.on("plugin.updated", () => void listPlugins()))
-    })
+    return null
   }
 
-  const [found] = createResource(guis, async (input) => {
-    const loaded = await Promise.all(input.plugins.map((plugin) => load(plugin, cache)))
-    // Main already ran its `runsOn` check on what it sends; a window that read the bundles itself runs it here, where
-    // no OS is known and only a plugin that lists none runs.
-    const plugins = props.bridge ? loaded : loaded.filter((plugin) => runsOn(plugin.definition, undefined))
-
-    const ids = new Set(loaded.map((plugin) => plugin.id))
-    cache.forEach((_, id) => {
-      if (!ids.has(id)) cache.delete(id)
-    })
-
-    return { plugins, reserved: input.reserved }
-  })
-
-  // Syncs the loaded plugins out to the plugin host.
   createEffect(() => {
-    const latest = found.latest
+    const ctx = controller()
 
-    if (!latest) return
-    // The server that runs the plugin, read each time: it is a new client after that server restarts.
-    const client = () => controller()?.sdk.api
-    props.onChange(
-      latest.plugins.map((plugin) => ({ definition: plugin.definition, options: plugin.options, client })),
-      latest.reserved,
-    )
+    if (!ctx || servers.ownUrl() !== window.location.origin || ctx.sdk.connection.status() !== "connected") return
+    let pending: AbortController | undefined
+
+    const refresh = () => {
+      pending?.abort()
+      const controller = new AbortController()
+      pending = controller
+      void ctx.sdk.api.experimental.plugin.webList({ signal: controller.signal }).then(
+        (listed) => {
+          if (controller.signal.aborted) return
+          const plugins = listed.filter((plugin) => pluginIdAvailable(plugin.id, builtins))
+          const reserved = listed.flatMap((plugin) => (pluginIdAvailable(plugin.id, builtins) ? [] : [plugin.id]))
+          dispatch({ type: "pushed", guis: { plugins, reserved } })
+        },
+        () => undefined,
+      )
+    }
+
+    onCleanup(ctx.sdk.event.on("plugin.updated", refresh))
+    onCleanup(() => pending?.abort())
+    refresh()
   })
 
   return null
 }
 
-/** Evaluates a plugin's bundle when its revision is new to this window. */
-async function load(plugin: BridgePluginGui, cache: Map<string, Loaded>): Promise<Loaded> {
-  const cached = cache.get(plugin.id)
+/** A failed module request leaves the previously published revision running until a fresh listing. */
+async function evaluate(plugin: GuiSource): Promise<LoadedPluginGui | undefined> {
+  const code = "code" in plugin ? plugin.code : await importWebFactory(plugin).catch(() => undefined)
 
-  if (cached?.revision === plugin.revision) return cached
+  if (code === undefined) {
+    console.error("[plugin] could not import web GUI", plugin.id)
 
-  const next = {
+    return undefined
+  }
+
+  return {
     id: plugin.id,
     revision: plugin.revision,
     options: plugin.options,
-    definition: await pluginDefinition(plugin.id, plugin.code),
+    definition: await pluginDefinition(plugin.id, code),
   }
+}
 
-  cache.set(plugin.id, next)
+async function importWebFactory(plugin: Extract<GuiSource, { ticket: string }>) {
+  const url = new URL("/api/experimental/plugin/web-module", window.location.origin)
+  url.search = new URLSearchParams({ id: plugin.id, revision: plugin.revision, ticket: plugin.ticket }).toString()
+  const module: { default: PluginFactory } = await import(/* @vite-ignore */ url.href)
 
-  return next
+  return module.default
 }

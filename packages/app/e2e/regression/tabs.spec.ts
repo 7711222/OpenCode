@@ -396,6 +396,36 @@ for (const tabLayout of ["horizontal", "vertical"] as const) {
   })
 }
 
+test("a tab whose overlapping renames both fail shows its saved title again", async ({ page }) => {
+  await mockWorkspace(page, { name: "Tabs", sessions: [a, b] })
+  await page.goto(sessionHref(a.id))
+  const title = page.locator(`[data-titlebar-tab-slot]:has(a[href="${sessionHref(a.id)}"]) [data-slot="tab-title"]`)
+  const editor = page.locator('[data-slot="tab-title"][contenteditable="plaintext-only"]')
+  await expect(title).toHaveText(a.title)
+  const released = Promise.withResolvers<void>()
+  const saves: string[] = []
+  await page.route(new RegExp(`/api/session/${a.id}(\\?|$)`), async (route) => {
+    if (route.request().method() !== "PATCH") return route.fallback()
+    saves.push(route.request().postDataJSON().title)
+    await released.promise
+    await route.fulfill({ status: 500, json: { message: "Rename failed" } })
+  })
+
+  for (const name of ["First name", "Second name"]) {
+    await title.dblclick()
+    await expect(editor).toBeFocused()
+    await editor.fill(name)
+    await editor.press("Enter")
+    await expect(title).toHaveText(name)
+  }
+
+  await expect.poll(() => saves).toEqual(["First name", "Second name"])
+  released.resolve()
+  // The rollback restores the title the server holds, never the first rename that was never saved.
+  await expect(title).toHaveText(a.title)
+  await expect(page.locator('[data-testid^="toast-v2-"]').filter({ hasText: "Request failed" })).toHaveCount(1)
+})
+
 for (const tabLayout of ["horizontal", "vertical"] as const) {
   test(`a ${tabLayout} tab deletes its session after confirmation`, async ({ page }) => {
     await mockWorkspace(page, { name: "Tabs", sessions: [a, b], seed: { settings: { appearance: { tabLayout } } } })
@@ -622,6 +652,22 @@ test("icon-only inactive tabs retain their avatar and attention badge instead of
   await tabB.locator("[data-titlebar-tab-link]").click()
   await expectPath(page, sessionHref(b.id))
   await expect(tabB.locator('[data-slot="tab-avatar-unread-dot"]')).toHaveCount(0)
+})
+
+test("an unread tab whose run failed shows the failed dot, as the inbox does", async ({ page }) => {
+  const time = { created: T0, updated: T0, idle: T0 + 1 }
+
+  await mockWorkspace(page, {
+    name: "FailedTabs",
+    sessions: [a, { ...b, outcome: "failed", time }, { ...c, outcome: "succeeded", time }],
+  })
+  await page.goto(sessionHref(a.id))
+  const tab = (id: string) => page.locator(`[data-titlebar-tab-slot]:has(a[href="${sessionHref(id)}"])`)
+
+  await expect(tab(b.id).locator('[data-mark="failed"]')).toBeVisible()
+  await expect(tab(b.id).locator('[data-mark="unread"]')).toBeHidden()
+  await expect(tab(c.id).locator('[data-mark="unread"]')).toBeVisible()
+  await expect(tab(c.id).locator('[data-mark="failed"]')).toBeHidden()
 })
 
 test("vertical tabs resize, scroll, show shortcut hints, and navigate", async ({ page }) => {
@@ -1030,6 +1076,10 @@ test("a remote tab stays busy while a child session runs", async ({ page }) => {
 test("inactive tabs stay busy while work waits in their inbox, and pulse on a new prompt, as in the TUI", async ({
   page,
 }) => {
+  // An inactive tab reads its inbox after a delay. The mock's inbox never gains pushed items, so a prompt pushed
+  // before that read starts would be replaced by the older snapshot.
+  const inboxC = page.waitForResponse(new RegExp(`/api/session/${c.id}/inbox(\\?|$)`))
+
   const workspace = await openSession(page, {
     name: "TabInbox",
     sessions: [a, b, c],
@@ -1058,6 +1108,7 @@ test("inactive tabs stay busy while work waits in their inbox, and pulse on a ne
   const progress = '[data-component="activity-ring"]'
 
   await expect(tab(b.id).locator(progress)).toBeVisible()
+  await inboxC
   await expect(tab(c.id).locator("[data-titlebar-tab-title]")).toHaveText(c.title)
   await expect(tab(c.id).locator(progress)).toBeHidden()
   await expect(tab(c.id).locator('[data-slot="tab-prompt-pulse"]')).toHaveCount(0)
@@ -1800,12 +1851,67 @@ test("the inbox Archived dialog searches only archived sessions and restores the
   await expect(dialog.getByText("No results found", { exact: true })).toBeVisible()
   await search.fill("First archived")
   await expect(dialog.getByRole("option")).toHaveCount(1)
-  await expect(dialog.getByRole("option", { name: /First archived session/ })).toHaveAttribute("aria-selected", "true")
+  const option = dialog.getByRole("option", { name: /First archived session/ })
+  await expect(option).toHaveAttribute("aria-selected", "true")
+
+  // A second Enter while the restore is in flight restores and opens the session once.
+  const restore = await holdRoute(page, /\/api\/session\/ses_archive_0(\?|$)/, { method: "PATCH" })
   await search.press("Enter")
+  await restore.arrived
+  await expect(option).toHaveAttribute("aria-busy", "true")
+  await expect(option.getByRole("img", { name: "Loading", exact: true })).toBeVisible()
+  await search.press("Enter")
+  await expect(dialog).toBeVisible()
+  restore.release()
   await expect(dialog).toHaveCount(0)
+  expect(restore.requests).toHaveLength(1)
   await expectPath(page, sessionHref("ses_archive_0"))
   await expect(page.locator('[data-component="composer-editor"]')).toBeEditable()
   await expect(rows.filter({ hasText: "First archived session" })).toHaveAttribute("data-state", "active")
+})
+
+test("deleting from the inbox closes its dialog at once and a slow delete leaves the next dialog open", async ({
+  page,
+}) => {
+  await mockWorkspace(page, {
+    name: "DeleteInbox",
+    sessions: [
+      { id: "ses_delete_kept", title: "Kept inbox session", time: { created: T0, updated: T0, idle: T0, viewed: T0 } },
+      {
+        id: "ses_delete_target",
+        title: "Deleted inbox session",
+        time: { created: T0, updated: T0 + 1, idle: T0 + 1, viewed: T0 + 1 },
+      },
+    ],
+    seed: { settings: { appearance: { tabLayout: "inbox" } }, tabs: [] },
+  })
+  const remove = await holdRoute(page, /\/api\/session\/ses_delete_target(\?|$)/, { method: "DELETE" })
+  await page.goto("/")
+
+  const rows = page.locator('[data-slot="sidebar-inbox"] [data-slot="sidebar-inbox-item"]')
+  await expect(rows).toHaveCount(2)
+  await rows.filter({ hasText: "Deleted inbox session" }).click({ button: "right" })
+  await page.getByRole("menuitem", { name: "Delete…", exact: true }).click()
+
+  const confirm = page.getByRole("dialog", { name: "Delete session" })
+  await confirm.getByRole("button", { name: "Delete session", exact: true }).click()
+  await remove.arrived
+  await expect(confirm).toHaveCount(0)
+  await expect(rows).toHaveCount(1)
+  await expect(rows).toContainText("Kept inbox session")
+
+  await page.getByRole("button", { name: "Search sessions", exact: true }).click()
+  const search = page.getByRole("dialog")
+  await expect(search.getByRole("combobox")).toBeFocused()
+
+  const removed = page.waitForResponse(
+    (response) => response.request().method() === "DELETE" && response.url().includes("/api/session/ses_delete_target"),
+  )
+
+  remove.release()
+  await removed
+  await expect(search.getByRole("combobox")).toBeFocused()
+  expect(remove.requests).toHaveLength(1)
 })
 
 test("opening a working session expands its shelf and still allows manual collapse", async ({ page }) => {
@@ -1999,15 +2105,21 @@ test("the inbox waits for initial requests and orders attention by waiting age r
   })
 
   const pending = await holdRoute(page, /\/api\/session\/ses_waiting_old\/permission(?:\?|$)/)
+  // Running sessions join Working only once this snapshot loads, which can be after the inbox shows; runs it reveals
+  // had already started, so they are not announced.
+  const running = await holdRoute(page, /\/api\/session\/active(?:\?|$)/)
 
   await page.goto("/")
-  await pending.arrived
+  await Promise.all([pending.arrived, running.arrived])
 
   const inbox = page.locator('[data-slot="sidebar-inbox"]')
 
   await expect(inbox).toHaveAttribute("aria-busy", "true")
   await expect(inbox.getByText("Sessions you work on will appear here", { exact: true })).toHaveCount(0)
+  const checked = page.waitForResponse(/\/api\/session\/ses_waiting_old\/permission(?:\?|$)/)
   pending.release()
+  await checked
+  running.release()
 
   const needs = inbox
     .getByRole("group", { name: "Needs attention", exact: true })
