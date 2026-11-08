@@ -15,6 +15,7 @@ import { Project } from "@opencode/core/project"
 import { ProjectTable } from "@opencode/core/project/sql"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Session } from "@opencode/core/session"
+import { SessionEvent } from "@opencode/core/session/event"
 import { SessionSearchIndex } from "@opencode/core/session/search-index"
 import { SessionSearchMaintenance } from "@opencode/core/session/search-maintenance"
 import { SessionTable } from "@opencode/core/session/sql"
@@ -175,6 +176,23 @@ describe("SessionSearchMaintenance", () => {
       yield* load(on)
       yield* elapse
       expect(yield* titles(db, "otter")).toEqual([Session.ID.make("ses_offline")])
+      expect(yield* titles(db, "walrus")).toEqual([Session.ID.make("ses_old")])
+    }),
+  )
+
+  it.effect("backfills only while no session is writing", () =>
+    Effect.gen(function* () {
+      const { db } = yield* setup
+      const bus = yield* Bus.Service
+      const write = bus.publish(SessionEvent.Renamed, { sessionID: Session.ID.make("ses_old"), title: "Busy" })
+      yield* load(location("busy", true))
+      yield* Effect.repeat(write.pipe(Effect.andThen(TestClock.adjust("2 seconds"))), { times: 20 })
+      expect(yield* SessionSearchIndex.status(db)).toMatchObject({
+        version: SessionSearchIndex.Version,
+        backfill: "titles",
+      })
+      yield* elapse
+      expect((yield* SessionSearchIndex.status(db)).backfill).toBe("done")
       expect(yield* titles(db, "walrus")).toEqual([Session.ID.make("ses_old")])
     }),
   )

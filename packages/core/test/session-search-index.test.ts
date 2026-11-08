@@ -202,6 +202,27 @@ describe("SessionSearchIndex", () => {
     }),
   )
 
+  it.effect("splits a backfill of large messages by stored size", () =>
+    Effect.gen(function* () {
+      const large = "x".repeat(SessionSearchIndex.MaxBatchBytes * 0.6)
+      const db = yield* database((db) =>
+        Effect.gen(function* () {
+          yield* addSession(db, sessionA, null)
+          yield* oldWriter(db, sessionA, 1, user("1", `puffin ${large}`))
+          yield* oldWriter(db, sessionA, 2, user("2", `gannet ${large}`))
+          yield* oldWriter(db, sessionA, 3, user("3", "tern"))
+        }),
+      )
+      yield* SessionSearchIndex.ensure(db)
+      // Titles first: the session has none.
+      expect(yield* SessionSearchIndex.backfillBatch(db)).toEqual({ indexed: 1, done: false })
+      // Newest first: the small message and the next large one fit together, the last large one goes alone.
+      expect(yield* SessionSearchIndex.backfillBatch(db)).toEqual({ indexed: 2, done: false })
+      expect(yield* SessionSearchIndex.backfillBatch(db)).toEqual({ indexed: 1, done: true })
+      expect((yield* find(db, "puffin gannet tern")).toSorted()).toEqual([id("1"), id("2"), id("3")])
+    }),
+  )
+
   it.effect("queues writes from a binary that does not know the index", () =>
     Effect.gen(function* () {
       const db = yield* database()

@@ -14,7 +14,8 @@ import { SessionSearchIndex } from "./search-index.js"
 export interface Interface {
   /**
    * Keeps the search index in step with `experimental.sqlite_fts`: builds it, backfills existing history in small
-   * transactions, then drains changes as Sessions write. Runs until interrupted, so fork it.
+   * transactions while no Session is writing, and indexes changes as Sessions write. Runs until interrupted, so fork
+   * it.
    */
   readonly run: Effect.Effect<never>
 }
@@ -33,17 +34,10 @@ const IDLE = "30 seconds"
 const SETTLE = "1 second"
 const SLOW_BATCH = 250
 /**
- * Backfill batches grow or shrink to take about this long, whatever the size of the messages in them: each one is a
- * synchronous transaction that holds the JS thread and the write lock.
+ * The backfill runs only once no Session has written for this long, so its transactions, which hold the JS thread
+ * and the write lock, never land while a reply streams. Changes to the queue are drained either way.
  */
-const TARGET_BATCH = { min: 10, max: 40 }
-const BATCH_LIMIT = { min: 1, initial: 25, max: 200 }
-/**
- * While Sessions are writing, the backfill slows to one batch per this long, so it barely competes with a streaming
- * reply but still finishes. Changes to the queue are drained at full speed either way.
- */
-const BUSY_PAUSE = "250 millis"
-const BUSY_FOR = 2_000
+const QUIET = 5_000
 
 export const layer = Layer.effect(
   Service,
@@ -59,17 +53,16 @@ export const layer = Layer.effect(
       unsupported: false,
       backfilled: false,
       backfill: undefined as { started: number; batches: number; slowest: number } | undefined,
-      limit: BATCH_LIMIT.initial,
       activity: 0,
     }
 
     yield* bus.subscribe().pipe(
-      Stream.filter((event) => state.active && isSessionEvent(event)),
+      Stream.filter(isSessionEvent),
       Stream.runForEach(() =>
         Clock.currentTimeMillis.pipe(
           Effect.flatMap((now) => {
             state.activity = now
-            return doorbell.open
+            return state.active ? doorbell.open : Effect.void
           }),
         ),
       ),
@@ -95,15 +88,17 @@ export const layer = Layer.effect(
       return undefined
     })
 
-    /** Runs one transaction and returns how long to pause before the next, or undefined when nothing is left. */
+    /**
+     * Runs one transaction. Returns how many milliseconds to wait before the next one, or undefined when only new
+     * changes are left.
+     */
     const batch = Effect.gen(function* () {
-      if ((yield* SessionSearchIndex.processBatch(db)) > 0) return PAUSE
+      if ((yield* SessionSearchIndex.processBatch(db)) > 0) return 0
       if (state.backfilled) return undefined
       const now = yield* Clock.currentTimeMillis
-      const result = yield* SessionSearchIndex.backfillBatch(db, state.limit)
+      if (now - state.activity < QUIET) return state.activity + QUIET - now
+      const result = yield* SessionSearchIndex.backfillBatch(db)
       const elapsed = (yield* Clock.currentTimeMillis) - now
-      if (elapsed < TARGET_BATCH.min) state.limit = Math.min(BATCH_LIMIT.max, state.limit * 2)
-      if (elapsed > TARGET_BATCH.max) state.limit = Math.max(BATCH_LIMIT.min, Math.floor(state.limit / 2))
       if (result.done && state.backfill === undefined) {
         state.backfilled = true
         return undefined
@@ -113,7 +108,7 @@ export const layer = Layer.effect(
       backfill.batches++
       backfill.slowest = Math.max(backfill.slowest, elapsed)
       if (elapsed > SLOW_BATCH) yield* Effect.logWarning("session search backfill batch was slow", { ms: elapsed })
-      if (!result.done) return now - state.activity < BUSY_FOR ? BUSY_PAUSE : PAUSE
+      if (!result.done) return 0
       state.backfilled = true
       state.backfill = undefined
       const status = yield* SessionSearchIndex.status(db)
@@ -126,7 +121,7 @@ export const layer = Layer.effect(
       return undefined
     })
 
-    /** Returns true when work remains. */
+    /** Returns how many milliseconds to wait before the next tick, or undefined to wait for new changes. */
     const tick = Effect.gen(function* () {
       const enabled = yield* configured
       state.active = enabled === true
@@ -135,14 +130,14 @@ export const layer = Layer.effect(
         state.backfill = undefined
         yield* Effect.logInfo("session search index dropped")
       }
-      if (enabled !== true || state.unsupported) return false
+      if (enabled !== true || state.unsupported) return undefined
       const capability = yield* SessionSearchIndex.ensure(db)
       if (!capability.supported) {
         state.unsupported = true
         yield* Effect.logWarning("session search index is not supported by this SQLite", {
           reason: capability.reason,
         })
-        return false
+        return undefined
       }
       if (capability.rebuilt) {
         state.backfilled = false
@@ -151,22 +146,22 @@ export const layer = Layer.effect(
       }
       const start = yield* Clock.currentTimeMillis
       while ((yield* Clock.currentTimeMillis) - start < SLICE) {
-        const pause = yield* batch
-        if (pause === undefined) return false
-        yield* Effect.sleep(pause)
+        const wait = yield* batch
+        if (wait !== 0) return wait
+        yield* Effect.sleep(PAUSE)
       }
-      return true
+      return 0
     })
 
     const loop = Effect.gen(function* () {
       yield* doorbell.close
-      const more = yield* tick.pipe(
+      const wait = yield* tick.pipe(
         Effect.catchCauseIf(
           (cause) => !Cause.hasInterrupts(cause),
-          (cause) => Effect.logError("session search maintenance failed", { cause }).pipe(Effect.as(false)),
+          (cause) => Effect.logError("session search maintenance failed", { cause }).pipe(Effect.as(undefined)),
         ),
       )
-      if (more) return yield* Effect.sleep(PAUSE)
+      if (wait !== undefined) return yield* Effect.sleep(wait === 0 ? PAUSE : wait)
       yield* doorbell.await.pipe(Effect.timeoutOption(IDLE))
       yield* Effect.sleep(SETTLE)
     })

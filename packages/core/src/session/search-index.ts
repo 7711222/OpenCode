@@ -161,12 +161,13 @@ export const processBatch = Effect.fn("SessionSearchIndex.processBatch")(functio
 
 /**
  * Indexes the next `limit` titles, then messages, that existed before the triggers, newest first, and advances the
- * stored cursor in the same transaction. Cursors follow the sources' primary keys, never their implicit rowids.
+ * stored cursor in the same transaction. A message batch also stops before {@link MaxBatchBytes} of stored rows, so a
+ * stretch of huge messages, whose whole JSON SQLite parses to find the text, is split across transactions. Cursors follow the sources' primary keys, never their implicit rowids.
  * Rows written after {@link ensure} are queued by the triggers too; indexing one twice is harmless. The cursor passes
  * assistants still streaming without queuing them: the write that finishes one is queued then, and one that never
  * finishes would otherwise sit in the queue forever.
  */
-export const backfillBatch = Effect.fn("SessionSearchIndex.backfillBatch")(function* (db: DatabaseService, limit = 25) {
+export const backfillBatch = Effect.fn("SessionSearchIndex.backfillBatch")(function* (db: DatabaseService, limit = 50) {
   return yield* db
     .transaction(
       () =>
@@ -193,20 +194,36 @@ export const backfillBatch = Effect.fn("SessionSearchIndex.backfillBatch")(funct
             )
             return { indexed: rows.length, done: false }
           }
-          // Message IDs ascend over time, so descending order is newest first.
-          const rows = yield* messageSources(
-            db,
-            state.after === undefined ? sql`1 = 1` : sql`message.id < ${state.after}`,
-            sql`ORDER BY message.id DESC LIMIT ${limit}`,
-          )
+          // Message IDs ascend over time, so descending order is newest first. Sizes come from the record headers,
+          // so choosing the batch reads no message body.
+          const candidates = yield* db.all<{ id: string; bytes: number }>(sql`
+            SELECT message.id, octet_length(message.data) + coalesce((
+              SELECT sum(octet_length(part.data)) FROM ${SessionPartTable} AS part
+              WHERE part.session_id = message.session_id AND part.message_id = message.id
+            ), 0) AS bytes
+            FROM ${SessionMessageTable} AS message
+            WHERE message.type IN (${sql.raw(IndexedTypes)})
+              ${state.after === undefined ? sql`` : sql`AND message.id < ${state.after}`}
+            ORDER BY message.id DESC
+            LIMIT ${limit}
+          `)
+          // The first message always goes in, so one larger than the budget still makes progress on its own.
+          const ids: string[] = []
+          let bytes = 0
+          for (const row of candidates) {
+            if (ids.length > 0 && bytes + row.bytes > MaxBatchBytes) break
+            ids.push(row.id)
+            bytes += row.bytes
+          }
+          const rows = ids.length === 0 ? [] : yield* messageSources(db, sql`message.id IN (${list(ids)})`)
           yield* write(db, rows)
-          const last = rows.at(-1)
-          const done = rows.length < limit || !last
+          const last = ids.at(-1)
+          const done = candidates.length < limit && ids.length === candidates.length
           yield* writeState(
             db,
-            done
+            done || last === undefined
               ? { version: Version, backfill: "done" }
-              : { version: Version, backfill: "messages", after: last.sourceID },
+              : { version: Version, backfill: "messages", after: last },
           )
           return { indexed: rows.length, done }
         }),
@@ -259,6 +276,8 @@ export const search = Effect.fn("SessionSearchIndex.search")(function* (
 }, Effect.orDie)
 
 const IndexTable = "session_search"
+/** Stored bytes of messages and their parts a backfill batch reads, at most, beyond its first message. */
+export const MaxBatchBytes = 1024 * 1024
 const Columns = "title, summary, user_text, assistant_text"
 // Title once per session, then summaries, what the user typed, and assistant text.
 const Rank = `bm25(${IndexTable}, 3.0, 4.0, 2.0, 1.0)`
